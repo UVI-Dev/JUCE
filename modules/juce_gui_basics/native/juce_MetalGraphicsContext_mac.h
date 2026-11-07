@@ -2865,9 +2865,11 @@ public:
         {
             // Placed as CoreGraphics places glyphs in a window (measured on lines of text at every
             // 1/20 px offset): x rounded down to 1/16 px, the baseline rounded up to a whole pixel
-            // (CoreGraphics works bottom-up). Both with a tolerance: CoreGraphics puts an x up to
-            // 1/1024 px below a 1/16 px step on that step (measured), and layout's float noise
-            // often lands there (an advance summing to 108.9998 for 109).
+            // (CoreGraphics works bottom-up). CoreGraphics first rounds the device x to a fixed grid
+            // of about 1/512 px, so an x up to 1/1024 px below a 1/16 px step lands on the step:
+            // measured at x = 300 to 1300 px and under 0.5x and 2x transforms (same threshold, so a
+            // device-space grid), on a 2x display. Layout's float noise often ends up there (an
+            // advance summing to 108.9998 for 109). The y tolerance only absorbs float noise.
             const auto pen = positions[i].transformedBy (glyphToDevice);
             constexpr auto steps = MetalRendering::GlyphAtlas::subpixelSteps;
             const auto qx = (int) std::floor ((pen.x + 1.0f / 1024.0f) * (float) steps);
