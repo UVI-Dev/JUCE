@@ -2865,10 +2865,12 @@ public:
         {
             // Placed as CoreGraphics places glyphs in a window (measured on lines of text at every
             // 1/20 px offset): x rounded down to 1/16 px, the baseline rounded up to a whole pixel
-            // (CoreGraphics works bottom-up). The tolerance absorbs float noise on whole positions.
+            // (CoreGraphics works bottom-up). Both with a tolerance: CoreGraphics puts an x up to
+            // 1/1024 px below a 1/16 px step on that step (measured), and layout's float noise
+            // often lands there (an advance summing to 108.9998 for 109).
             const auto pen = positions[i].transformedBy (glyphToDevice);
             constexpr auto steps = MetalRendering::GlyphAtlas::subpixelSteps;
-            const auto qx = (int) std::floor (pen.x * (float) steps);
+            const auto qx = (int) std::floor ((pen.x + 1.0f / 1024.0f) * (float) steps);
             const auto x = qx >= 0 ? qx / steps : -((-qx + steps - 1) / steps);
             const Point<int> snapped (x, (int) std::ceil (pen.y - 1.0f / 64.0f));
             const auto subpixel = qx - x * steps;
