@@ -69,6 +69,7 @@
 #if JUCE_MAC
  #import <IOKit/pwr_mgt/IOPMLib.h>
  #import <MetalKit/MetalKit.h>
+ #import <QuartzCore/QuartzCore.h>
 
  #if JUCE_MAC_API_VERSION_MIN_REQUIRED_AT_LEAST (14, 4)
   #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -166,6 +167,10 @@
 #if JUCE_MAC || JUCE_IOS
  #include "native/accessibility/juce_AccessibilitySharedCode_mac.mm"
  #include "native/juce_CGMetalLayerRenderer_mac.h"
+
+ #if JUCE_MAC && JUCE_METAL_RENDERER
+  #include "native/juce_MetalGraphicsContext_mac.h"
+ #endif
 
  #if JUCE_IOS
   #include "native/juce_UIViewComponentPeer_ios.mm"

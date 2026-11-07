@@ -78,6 +78,18 @@
  #define JUCE_ENABLE_REPAINT_DEBUGGING 0
 #endif
 
+/** Config: JUCE_METAL_RENDERER
+    (macOS only) Adds a GPU "Metal Renderer" rendering engine to native windows, used by default
+    when a Metal device is available. Each window keeps the exact list of dirty rectangles and
+    repaints only those into a retained GPU texture, so separate small repaints are never merged
+    into their bounding box. Operations without a GPU implementation are rendered by the software
+    renderer and composited. Implies the CAMetalLayer backing of
+    JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS.
+*/
+#ifndef JUCE_METAL_RENDERER
+ #define JUCE_METAL_RENDERER 0
+#endif
+
 /** Config: JUCE_USE_XRANDR
     Enables Xrandr multi-monitor support (Linux only).
     Unless you specifically want to disable this, it's best to leave this option turned on.

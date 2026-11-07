@@ -38,6 +38,13 @@
 @end
 
 //==============================================================================
+// The Metal renderer reuses the CAMetalLayer backing and displayLayer plumbing of the
+// multiple-paint-calls path (the peer keeps its exact dirty list, AppKit never coalesces it).
+#if JUCE_METAL_RENDERER
+ #undef  JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS
+ #define JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS 1
+#endif
+
 namespace juce
 {
 
@@ -217,6 +224,17 @@ public:
         {
             metalRenderer = CoreGraphicsMetalLayerRenderer::create();
             layerDelegate.reset (JuceCALayerDelegate::construct (this));
+
+           #if JUCE_METAL_RENDERER
+            if (metalRenderer != nullptr)
+            {
+                gpuRenderer = MetalLayerRenderer::create();
+                usingGpuRenderer = gpuRenderer != nullptr;
+
+                if (gpuRenderer != nullptr)
+                    gpuRenderer->setRepaintCallback ([this] (Rectangle<float> area) { repaint (area.getSmallestIntegerContainer()); });
+            }
+           #endif
         }
        #endif
 
@@ -229,7 +247,7 @@ public:
 
        #if JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS
         if (@available (macOS 10.14, *))
-            if (metalRenderer != nullptr)
+            if (isUsingMetalLayer())
                 view.layer.delegate = layerDelegate.get();
        #endif
       #endif
@@ -812,10 +830,25 @@ public:
 
     StringArray getAvailableRenderingEngines() override
     {
+        return getRenderingEngineNames();
+    }
+
+    [[nodiscard]] StringArray getRenderingEngineNames() const
+    {
         StringArray s ("Software Renderer");
 
        #if USE_COREGRAPHICS_RENDERING
         s.add ("CoreGraphics Renderer");
+       #endif
+
+       #if JUCE_METAL_RENDERER
+        // "CoreGraphics Renderer" is stock CoreGraphics drawing asynchronously into a default
+        // layer; "CoreGraphics Metal Layer Renderer" is JUCE's multiple-paint-calls path.
+        if (gpuRenderer != nullptr)
+        {
+            s.add (metalLayerCoreGraphicsEngineName);
+            s.add (metalEngineName);
+        }
        #endif
 
         return s;
@@ -823,11 +856,40 @@ public:
 
     int getCurrentRenderingEngine() const override
     {
+       #if JUCE_METAL_RENDERER
+        if (gpuRenderer != nullptr)
+        {
+            const auto* name = usingGpuRenderer         ? metalEngineName
+                             : ! usingCoreGraphics      ? "Software Renderer"
+                             : isUsingMetalLayer()      ? metalLayerCoreGraphicsEngineName
+                                                        : "CoreGraphics Renderer";
+
+            return jmax (0, getRenderingEngineNames().indexOf (name));
+        }
+       #endif
+
         return usingCoreGraphics ? 1 : 0;
     }
 
     void setCurrentRenderingEngine ([[maybe_unused]] int index) override
     {
+       #if JUCE_METAL_RENDERER
+        if (gpuRenderer != nullptr)
+        {
+            const auto name = getAvailableRenderingEngines()[index];
+
+            if (name.isEmpty())
+                return;
+
+            usingGpuRenderer = name == metalEngineName;
+            usingCoreGraphics = name != "Software Renderer";
+
+            setMetalLayerBacking (usingGpuRenderer || name == metalLayerCoreGraphicsEngineName);
+            component.repaint();
+            return;
+        }
+       #endif
+
        #if USE_COREGRAPHICS_RENDERING
         if (usingCoreGraphics != (index > 0))
         {
@@ -1115,7 +1177,7 @@ public:
         // [view getRectsBeingDrawn: ...] sometime around 10.13, so on later versions of macOS
         // numRects will always be 1, and you'll need to use a CoreGraphicsMetalLayerRenderer
         // to avoid CoreGraphics consolidating disparate rects.
-        if (usingCoreGraphics && metalRenderer == nullptr)
+        if (usingCoreGraphics && ! isUsingMetalLayer())
         {
             const NSRect* rects = nullptr;
             NSInteger numRects = 0;
@@ -1910,6 +1972,61 @@ public:
     NSUniquePtr<NSObject<CALayerDelegate>> layerDelegate;
    #endif
 
+   #if JUCE_METAL_RENDERER
+    std::unique_ptr<MetalLayerRenderer> gpuRenderer;
+    bool usingGpuRenderer = false;
+
+    static constexpr auto metalEngineName = "Metal Renderer";
+    static constexpr auto metalLayerCoreGraphicsEngineName = "CoreGraphics Metal Layer Renderer";
+   #endif
+
+    // False when a JUCE_METAL_RENDERER build switched to an engine that draws through AppKit.
+    bool wantsMetalLayer = true;
+
+    [[nodiscard]] bool isUsingMetalLayer() const noexcept
+    {
+       #if JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS
+        return metalRenderer != nullptr && wantsMetalLayer;
+       #else
+        return false;
+       #endif
+    }
+
+   #if JUCE_METAL_RENDERER
+    /*  AppKit only asks makeBackingLayer for a new layer when layer backing is turned off and on
+        again, so that is how the view swaps between a CAMetalLayer and a default (CoreGraphics)
+        layer at runtime.
+    */
+    void setMetalLayerBacking (bool shouldUseMetalLayer)
+    {
+        if (wantsMetalLayer == shouldUseMetalLayer)
+            return;
+
+        wantsMetalLayer = shouldUseMetalLayer;
+
+        if (! [view wantsLayer])
+            return;
+
+        [view setWantsLayer: NO];
+        [view setWantsLayer: YES];
+
+        // Turning layer backing off resets the redraw policy to 'never', which would stop
+        // setNeedsDisplayInRect from reaching the new layer: restore what the constructor set.
+        [view setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize];
+        [view layer].drawsAsynchronously = YES;
+
+        // A layer-backed ancestor can keep the old layer alive; follow what the view really has so
+        // drawRect and displayLayer stay consistent with it.
+        wantsMetalLayer = [[view layer] isKindOfClass: [CAMetalLayer class]];
+        usingGpuRenderer = usingGpuRenderer && wantsMetalLayer;
+
+        if (wantsMetalLayer)
+            [view layer].delegate = layerDelegate.get();
+
+        [view setNeedsDisplay: YES];
+    }
+   #endif
+
 private:
     JUCE_DECLARE_WEAK_REFERENCEABLE (NSViewComponentPeer)
 
@@ -2145,7 +2262,7 @@ private:
     void displayLayer ([[maybe_unused]] CALayer* layer) override
     {
        #if JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS
-        if (metalRenderer == nullptr)
+        if (! isUsingMetalLayer())
             return;
 
         const auto scale = [this]
@@ -2155,6 +2272,21 @@ private:
 
             return 1.0f;
         }();
+
+       #if JUCE_METAL_RENDERER
+        if (usingGpuRenderer)
+        {
+            // Repaints requested while painting stay queued, with the rects that couldn't be drawn.
+            auto notDrawn = gpuRenderer->drawRectangleList (static_cast<CAMetalLayer*> (layer),
+                                                            scale,
+                                                            [this] (LowLevelGraphicsContext& context) { handlePaint (context); },
+                                                            std::exchange (deferredRepaints, {}),
+                                                            [view inLiveResize],
+                                                            component.isOpaque());
+            deferredRepaints.add (notDrawn);
+            return;
+        }
+       #endif
 
         deferredRepaints = metalRenderer->drawRectangleList (static_cast<CAMetalLayer*> (layer),
                                                              scale,
@@ -2404,13 +2536,26 @@ struct JuceNSViewClass final : public NSViewComponentPeerWrapper<ObjCClass<NSVie
         {
             if (auto* owner = getOwner (self))
             {
-                if (owner->metalRenderer != nullptr)
+                if (owner->isUsingMetalLayer())
                 {
                     auto* layer = [CAMetalLayer layer];
 
                     layer.device = MTLCreateSystemDefaultDevice();
                     layer.framebufferOnly = NO;
+
+                   #if JUCE_METAL_RENDERER
+                    // The GPU renderer blends in the same (gamma-encoded) space as CoreGraphics and
+                    // blits its BGRA8Unorm target into the drawable, so the formats must match.
+                    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+                    if (auto colourSpace = CGColorSpaceCreateWithName (kCGColorSpaceSRGB))
+                    {
+                        layer.colorspace = colourSpace;
+                        CGColorSpaceRelease (colourSpace);
+                    }
+                   #else
                     layer.pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+                   #endif
                     layer.opaque = getOwner (self)->getComponent().isOpaque();
                     layer.needsDisplayOnBoundsChange = YES;
                     layer.drawsAsynchronously = YES;
