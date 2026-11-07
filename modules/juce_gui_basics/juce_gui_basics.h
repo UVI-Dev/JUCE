@@ -90,6 +90,17 @@
  #define JUCE_METAL_RENDERER 0
 #endif
 
+/** Config: JUCE_METAL_RENDERER_DIRTY_RECT
+    (macOS, with JUCE_METAL_RENDERER) Tells the window server which part of each frame changed,
+    so that it recomposites only that rectangle rather than the whole window. This uses a private
+    Core Animation property (CAMetalDrawable's dirtyRect), checked at runtime: where it doesn't
+    exist, the whole window is recomposited as without this option. Separate dirty areas count
+    as their bounding rectangle.
+*/
+#ifndef JUCE_METAL_RENDERER_DIRTY_RECT
+ #define JUCE_METAL_RENDERER_DIRTY_RECT 0
+#endif
+
 /** Config: JUCE_USE_XRANDR
     Enables Xrandr multi-monitor support (Linux only).
     Unless you specifically want to disable this, it's best to leave this option turned on.

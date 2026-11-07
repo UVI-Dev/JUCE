@@ -85,6 +85,10 @@
 // Metal classes are only used behind @available checks or on systems where the device exists.
 JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wunguarded-availability", "-Wunguarded-availability-new")
 
+#if JUCE_METAL_RENDERER_DIRTY_RECT
+ #import <objc/message.h>
+#endif
+
 namespace juce
 {
 
@@ -3413,6 +3417,10 @@ public:
         for (const auto& r : region)
             frame.dirtyPixels += (int64) r.getWidth() * r.getHeight();
 
+       #if JUCE_METAL_RENDERER_DIRTY_RECT
+        dirtyRects->recorded (frame.number, region.getBounds());
+       #endif
+
         if (layer.opaque != opaque)
             layer.opaque = opaque;
 
@@ -4165,6 +4173,14 @@ private:
         const auto windowArea = Rectangle<int> ((int) source.width, (int) source.height).toFloat() / frame.scale;
         auto repaint = missedPresentRepaint;
 
+       #if JUCE_METAL_RENDERER_DIRTY_RECT
+        auto dirty = dirtyRects;
+        const auto frameNumber = frame.number;
+        const auto markDirty = [dirty, frameNumber, layer] (id<CAMetalDrawable> drawable) { dirty->beforePresent (drawable, frameNumber, layer); };
+       #else
+        const auto markDirty = [] (id<CAMetalDrawable>) {};
+       #endif
+
         // Without a drawable the window keeps showing an older frame until it next repaints.
         const auto requestRepaint = [repaint, windowArea]
         {
@@ -4185,9 +4201,14 @@ private:
                 [commandBuffer waitUntilScheduled];
 
                 if (drawable != nil)
+                {
+                    markDirty (drawable);
                     [drawable present];
+                }
                 else
+                {
                     requestRepaint();
+                }
             }
 
             return;
@@ -4214,6 +4235,7 @@ private:
                         stats->presentMicros += (int64) ((done.GPUEndTime - done.GPUStartTime) * 1.0e6);
                     }];
 
+                markDirty (drawable);
                 [present presentDrawable: drawable];
                 [present commit];
             }
@@ -4230,6 +4252,100 @@ private:
     std::shared_ptr<Statistics> statistics; // shared with completion handlers, which can outlive this object
     // Shared with the blocks that request repaints, which can outlive this object.
     std::shared_ptr<std::function<void (Rectangle<float>)>> missedPresentRepaint = std::make_shared<std::function<void (Rectangle<float>)>>();
+
+   #if JUCE_METAL_RENDERER_DIRTY_RECT
+    /*  JUCE_METAL_RENDERER_DIRTY_RECT: tells Core Animation which part of each drawable changed,
+        through the private -[CAMetalDrawable setDirtyRect:] (QuartzCore hands it to the layer's
+        image queue on present; the default is CGRectInfinite), in drawable pixels with the origin
+        at the top left. WindowServer then recomposites that rect rather than the whole window
+        (measured on an M1, one small area repainting at 60 Hz: WindowServer GPU 98 -> 3 ms/s,
+        CPU 358 -> 255 ms/s; ScreenCaptureKit's dirty rects show the same rect). The drawable
+        still receives the whole frame, so what it shows never depends on this.
+        WindowServer may skip a frame (two presents in one refresh), and the next frame's rect
+        must then cover what the skipped one changed: the rect is everything recorded since the
+        last frame known to be on screen (its presented handler reports a presentedTime), or the
+        whole drawable when that isn't known (a new layer, or too many frames since). One rect per
+        frame: separate dirty areas count as their bounding box.
+        Shared with the present blocks (Metal threads), which can outlive the renderer.
+    */
+    class DirtyRects : public std::enable_shared_from_this<DirtyRects>
+    {
+    public:
+        // Message thread: the dirty bounds (device pixels) of a frame about to be encoded.
+        void recorded (uint64_t frame, Rectangle<int> bounds)
+        {
+            const std::scoped_lock sl (mutex);
+            history[frame % history.size()] = { frame, bounds };
+        }
+
+        // Metal thread, just before the frame is presented.
+        void beforePresent (id<CAMetalDrawable> drawable, uint64_t frame, CAMetalLayer* layer)
+        {
+            static const auto setDirtyRect = NSSelectorFromString (@"setDirtyRect:");
+            static const auto available = [(id) drawable respondsToSelector: setDirtyRect];
+
+            if (! available)
+                return;
+
+            if (const auto bounds = changedSinceShown (frame, layer))
+                ((void (*) (id, SEL, CGRect)) objc_msgSend) (drawable, setDirtyRect, makeCGRect (*bounds));
+
+            auto self = shared_from_this();
+            [drawable addPresentedHandler: ^(id<MTLDrawable> presented)
+            {
+                if (presented.presentedTime > 0)
+                    self->onScreen (frame, layer);
+            }];
+        }
+
+    private:
+        // Nothing (the whole drawable) unless every frame since the one on screen is known.
+        std::optional<Rectangle<int>> changedSinceShown (uint64_t frame, CAMetalLayer* layer)
+        {
+            const std::scoped_lock sl (mutex);
+
+            if (layer != shownLayer || shown == 0 || frame <= shown || frame - shown > history.size())
+                return {};
+
+            Rectangle<int> bounds;
+
+            for (auto f = shown + 1; f <= frame; ++f)
+            {
+                const auto& entry = history[f % history.size()];
+
+                if (entry.frame != f)
+                    return {};
+
+                bounds = bounds.getUnion (entry.bounds);
+            }
+
+            return bounds;
+        }
+
+        void onScreen (uint64_t frame, CAMetalLayer* layer)
+        {
+            const std::scoped_lock sl (mutex);
+
+            if (layer != shownLayer)
+            {
+                shownLayer = layer;
+                shown = frame;
+            }
+            else
+            {
+                shown = jmax (shown, frame);
+            }
+        }
+
+        struct Entry { uint64_t frame = 0; Rectangle<int> bounds; };
+        std::mutex mutex;
+        std::array<Entry, 8> history;
+        uint64_t shown = 0;               // the last frame known to be on screen
+        const void* shownLayer = nullptr; // its layer (not retained: only compared)
+    };
+
+    std::shared_ptr<DirtyRects> dirtyRects = std::make_shared<DirtyRects>();
+   #endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MetalLayerRenderer)
     JUCE_DECLARE_NON_MOVEABLE (MetalLayerRenderer)
