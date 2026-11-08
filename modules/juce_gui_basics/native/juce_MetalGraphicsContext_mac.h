@@ -125,6 +125,9 @@ constexpr const char* shaderSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
+// Tested and not kept: computing in half precision (twice the ALU rate of float on Apple GPUs)
+// saved 2.5% of the GPU time on a widget grid and took edges further from CoreGraphics.
+
 // xf0.w: the instance's painter's order (its index when recorded), which sets its depth: draws are
 // reordered before encoding (see FrameRecorder::reorder), so the buffer position isn't that order.
 struct Inst { float4 xf0; float4 xf1; float4 rect; float4 clip; float4 colour; float4 params; float4 uv; };
@@ -775,7 +778,17 @@ fragment float4 accumFs (AccOut in [[stage_in]], const device Seg* segs [[buffer
 // them) and sums their deltas in each cell: a quad per edge would be about twice as many as the
 // CPU-built outline has, and the vertex stage of this pass is already as costly as its fragments.
 // The CPU lists the quads (StrokeQuad): a point has as many as its edges need (round joins: as
-// many arc steps as their turn takes). ----
+// many arc steps as their turn takes).
+// Tested and not kept, measured on an M1 (Metal System Trace) against the CPU-built outline:
+// - A compute pass writing the edges into a buffer that accumVs then draws: about 0.4 ms more per
+//   frame whatever the stroke (the accumulation waits for it).
+// - One instance per edge, in a fixed number of slots per point: about five quads per point, twice
+//   the CPU outline's, and the vertex stage costs per quad, empty or not (4 ms per frame for 50k
+//   points against 1.9). Larger varyings per vertex overflowed the tiler's parameter buffer.
+// - A quad's fragments summing all eight edge slots rather than those in use: +50% at 1 px.
+// - Each edge recomputing its point's joints, rather than once per vertex: +28% vertex time.
+// - Before this, the CPU outline written straight into segments (no Path, no second flattening):
+//   only 15-20% less encoding, the joints' maths dominating. ----
 struct StrokeJob
 {
     float4 xf0, xf1;    // stroke space -> atlas px: x' = dot (xf0.xy, p) + xf0.z, y' = dot (xf1.xy, p) + xf1.z
@@ -2117,6 +2130,20 @@ struct FrameRecorder
     struct StrokePoint { float x, y; };                                                                      // must match 'StrokePoint'
 
     static constexpr int coveragePageWidth = 2048, coveragePageMaxHeight = 4096;
+
+    /*  Tested and not kept, measured on an M1 (Metal System Trace) and on a busy plug-in page:
+        - Sparse coverage, as tile-based renderers do: a path's area cut into 32 x 16 tiles, only
+          the runs of tiles its edges touch summed and composited, the others drawn solid or not at
+          all from a winding number counted on the CPU (from the edges crossing each tile row's
+          top; horizontal edges must mark their tiles too). 5% off the composite and 7-33% off the
+          prefix sums, about 0.05 ms per frame (some 4% of that page's GPU time), for ~400 lines
+          and a CPU winding count that must match the GPU's sums exactly. The composite's empty
+          pixels were already cheap: one read, then discarded.
+        - Caching the coverage of paths unchanged from the previous frame: on that page (animated
+          modulations and histories) no path repeated.
+        - Flattening fills on the GPU: it must place vertices as PathFlatteningIterator does to keep
+          EdgeTable's pixels, and the whole encoding was 0.2 ms per frame on that page.
+    */
 
     /*  A path whose coverage the frame needs. paint() only records it (a copy of the path, its
         place in the atlas); its outline is built and flattened into segments on the encode thread
