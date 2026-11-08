@@ -56,10 +56,11 @@
       as WebRender's opaque pass: the GPU rejects what they cover before shading it.
     - Rects, rounded rects, circles and lines: distance to the outline per pixel, turned into the
       exact area of the pixel inside it (halfPlaneCoverage), under any affine transform.
-    - Paths (fills, and strokes converted to fills by PathStrokeType) by coverage counting: their
-      flattened edges are accumulated as signed areas in an R32Float atlas on the GPU and a prefix
-      sum per row gives each pixel its winding number with exact area anti-aliasing (as
-      juce::EdgeTable). clipToPath reads the same coverage.
+    - Paths by coverage counting: their flattened edges are accumulated as signed areas in an
+      R32Float atlas on the GPU and a prefix sum per row gives each pixel its winding number with
+      exact area anti-aliasing (as juce::EdgeTable). clipToPath reads the same coverage. A
+      stroke's outline (offset edges, joins, caps) is built from its centre line on the GPU, by
+      the vertex shader of its accumulation (strokeAccumVs).
     - Glyphs: rasterised once by JUCE's CoreGraphics context into an R8 atlas, and found
       through one table per font size.
     - Gradients (colour stops interpolated per pixel), tiled-image fills, image clips, the image
@@ -724,6 +725,27 @@ float coveredFraction (float right, float xa, float xb)
                             : (0.5 * (b * b - a * a) + (max (hi, 1.0) - max (lo, 1.0))) / (hi - lo);
 }
 
+// A segment's delta in a cell of its path's rectangle, whose left side is at x = left.
+float edgeDelta (float4 line, float2 cell, float left)
+{
+    // The part of the segment within this pixel row (signed: the edge direction gives the winding).
+    const float ya = clamp (line.y, cell.y, cell.y + 1.0);
+    const float yb = clamp (line.w, cell.y, cell.y + 1.0);
+    const float dy = yb - ya;
+
+    if (dy == 0.0)
+        return 0.0;
+
+    const float dxdy = (line.z - line.x) / (line.w - line.y);
+    const float xa = line.x + (ya - line.y) * dxdy;
+    const float xb = line.x + (yb - line.y) * dxdy;
+
+    // Delta from the previous cell; the rectangle's first column holds the full value.
+    const float here = coveredFraction (cell.x + 1.0, xa, xb);
+    const float before = cell.x > left ? coveredFraction (cell.x, xa, xb) : 0.0;
+    return dy * (here - before);
+}
+
 fragment float4 accumFs (AccOut in [[stage_in]], const device Seg* segs [[buffer(0)]])
 {
     const Seg s = segs[in.sid];
@@ -733,22 +755,380 @@ fragment float4 accumFs (AccOut in [[stage_in]], const device Seg* segs [[buffer
     if (cell.x < s.rect.x || cell.x >= s.rect.z)
         discard_fragment();
 
-    // The part of the segment within this pixel row (signed: the edge direction gives the winding).
-    const float ya = clamp (s.line.y, cell.y, cell.y + 1.0);
-    const float yb = clamp (s.line.w, cell.y, cell.y + 1.0);
-    const float dy = yb - ya;
+    const float d = edgeDelta (s.line, cell, s.rect.x);
 
-    if (dy == 0.0)
+    if (d == 0.0)
         discard_fragment();
 
-    const float dxdy = (s.line.z - s.line.x) / (s.line.w - s.line.y);
-    const float xa = s.line.x + (ya - s.line.y) * dxdy;
-    const float xb = s.line.x + (yb - s.line.y) * dxdy;
+    return float4 (d, 0.0, 0.0, 0.0);
+}
 
-    // Delta from the previous cell; the rectangle's first column holds the full value.
-    const float here = coveredFraction (cell.x + 1.0, xa, xb);
-    const float before = cell.x > s.rect.x ? coveredFraction (cell.x, xa, xb) : 0.0;
-    return float4 (dy * (here - before), 0.0, 0.0, 0.0);
+// ---- Strokes: their outline is built on the GPU from the centre line, each segment on its own
+// (Levien & Uguray, "GPU-friendly Stroke Expansion", 2024). The outline of a stroke is a
+// closed loop of edges (the left offsets forwards, the end cap, the right offsets backwards, the
+// start cap) and coverage counting only needs its edges, in any order. So each point of the centre
+// line owns the edges around it: the two offset edges of the segment starting there and its join
+// with the next (the outer side beveled, mitered or rounded; the inner side a bevel, whose overlap
+// the non-zero rule absorbs, as in that paper); an open sub-path's first point also owns the
+// start cap, its last point the end cap. They are built in the stroke's space (where its width
+// is), then transformed to the atlas. A quad covers up to eight of a point's edges (usually all of
+// them) and sums their deltas in each cell: a quad per edge would be about twice as many as the
+// CPU-built outline has, and the vertex stage of this pass is already as costly as its fragments.
+// The CPU lists the quads (StrokeQuad): a point has as many as its edges need (round joins: as
+// many arc steps as their turn takes). ----
+struct StrokeJob
+{
+    float4 xf0, xf1;    // stroke space -> atlas px: x' = dot (xf0.xy, p) + xf0.z, y' = dot (xf1.xy, p) + xf1.z
+    float4 rect;        // the path's atlas rectangle
+    float4 style;       // half width, miter limit squared, arc step (radians), unused
+    uint4 layout;       // joint (PathStrokeType::JointStyle), cap (EndCapStyle), edges per cap, arc steps per half turn
+};
+struct StrokeSub { uint first, count, closed, job; };
+struct StrokePoint { float2 p; };
+struct StrokeQuad { uint point, subAndEdge; }; // the point (index in the points), its sub-path << 8 | its first edge
+
+constant uint strokeEdgesPerQuad = 8;
+
+float2 rotated (float2 v, float angle)
+{
+    const float c = cos (angle), s = sin (angle);
+    return float2 (v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+// Edge m of the arc from c + v0 to c + v1, turning by 'angle' in steps of at most 'step'.
+bool arcEdge (float2 c, float2 v0, float2 v1, float angle, float step, uint maxSteps, uint m, thread float2& a, thread float2& b)
+{
+    const uint n = clamp (uint (ceil (abs (angle) / step)), 1u, maxSteps);
+
+    if (m >= n)
+        return false;
+
+    a = c + (m == 0 ? v0 : rotated (v0, angle * float (m) / float (n)));
+    b = c + (m + 1 == n ? v1 : rotated (v0, angle * float (m + 1) / float (n)));
+    return true;
+}
+
+// A joint of the centre line: at p, from the segment along t0 (length len0; offset n0: t0 turned a
+// quarter turn, times the half width) to the one along t1. The outer side is the right (-n) when
+// turning towards +n (cr > 0). On the inner side, the two offset lines cross at
+// p +- (n0 + n1) / (1 + d), which lies on both offset edges when half the width times
+// tan (half the turn) is at most both lengths: they then end there, as in PathStrokeType's outline
+// (its lineIntersection). Otherwise an inner bevel joins them, and the overlap it leaves is
+// absorbed by the non-zero rule, as in that paper and in PathStrokeType for short segments.
+// Built by one function wherever it is needed, so that the two segments meeting there agree.
+struct Joint
+{
+    float2 p, t0, t1, n0, n1;
+    float cr, d;
+    bool innerMeets;
+    float2 inner; // where the inner offset edges end when they meet
+};
+
+Joint strokeJoint (const device StrokePoint* points, StrokeSub sub, uint j, float hw)
+{
+    const uint n = sub.count;
+    const float2 before = points[sub.first + (j + n - 1) % n].p, p = points[sub.first + j % n].p;
+    const float2 after = points[sub.first + (j + 1) % n].p;
+    const float len0 = length (p - before), len1 = length (after - p);
+
+    Joint J;
+    J.p = p;
+    J.t0 = (p - before) / len0;
+    J.t1 = (after - p) / len1;
+    J.n0 = hw * float2 (-J.t0.y, J.t0.x);
+    J.n1 = hw * float2 (-J.t1.y, J.t1.x);
+    J.cr = J.t0.x * J.t1.y - J.t0.y * J.t1.x;
+    J.d = dot (J.t0, J.t1);
+    J.innerMeets = J.cr != 0.0 && 1.0 + J.d > 0.0 && hw * abs (J.cr) <= (1.0 + J.d) * min (len0, len1);
+    const float2 m = (J.n0 + J.n1) / (1.0 + J.d);
+    J.inner = J.cr > 0.0 ? p + m : p - m;
+    return J;
+}
+
+// Edge e of a joint's join: the loop goes p + n0 -> p + n1 on the left, p - n1 -> p - n0 on the
+// right. The outer side gets the miter point or the arc; the inner side a bevel unless its offset
+// edges meet.
+bool joinEdge (const device StrokeJob& job, Joint J, uint e, thread float2& a, thread float2& b)
+{
+    const float2 front0 = J.p + J.n0, front1 = J.p + J.n1, back0 = J.p - J.n1, back1 = J.p - J.n0;
+    const bool backIsOuter = J.cr > 0.0;
+    const float2 inner0 = backIsOuter ? front0 : back0, inner1 = backIsOuter ? front1 : back1;
+
+    // Mitered, within the limit (PathStrokeType: the miter point at most miterLimit half widths
+    // from p, i.e. 1 / cos (half the turn) <= miterLimit): the outer side through the miter point.
+    if (job.layout.x == 0 && J.cr != 0.0 && 2.0 <= (1.0 + J.d) * job.style.y)
+    {
+        const float2 m = (J.n0 + J.n1) / (1.0 + J.d);
+        const float2 outer0 = backIsOuter ? back0 : front0, outer1 = backIsOuter ? back1 : front1;
+        const float2 tip = backIsOuter ? J.p - m : J.p + m;
+
+        switch (e)
+        {
+            case 0:  a = outer0; b = tip; return true;
+            case 1:  a = tip; b = outer1; return true;
+            case 2:  a = inner0; b = inner1; return ! J.innerMeets;
+            default: return false;
+        }
+    }
+
+    // Curved: the inner bevel, then an arc on the outer side; a full reversal turns round the end,
+    // on the left.
+    if (job.layout.x == 1 && (J.cr != 0.0 || J.d < 0.0))
+    {
+        const float angle = J.cr == 0.0 ? -M_PI_F : atan2 (J.cr, J.d);
+
+        if (e == 0)
+        {
+            a = angle > 0.0 ? front0 : back0;
+            b = angle > 0.0 ? front1 : back1;
+            return ! J.innerMeets;
+        }
+
+        return angle > 0.0 ? arcEdge (J.p, -J.n1, -J.n0, -angle, job.style.z, job.layout.w, e - 1, a, b)
+                           : arcEdge (J.p, J.n0, J.n1, angle, job.style.z, job.layout.w, e - 1, a, b);
+    }
+
+    // Beveled (or straight on): both sides, the inner one unless its edges meet.
+    switch (e)
+    {
+        case 0:  a = front0; b = front1; return ! (J.innerMeets && backIsOuter);
+        case 1:  a = back0; b = back1; return ! (J.innerMeets && ! backIsOuter);
+        default: return false;
+    }
+}
+
+// Edge e of a cap at p, from p + v (v: the offset, a quarter turn from the outward direction
+// 'out') round to p - v.
+bool capEdge (const device StrokeJob& job, float2 p, float2 out, float2 v, uint e, thread float2& a, thread float2& b)
+{
+    if (job.layout.y == 2) // rounded: half a turn through p + out
+        return arcEdge (p, v, -v, -M_PI_F, job.style.z, job.layout.w, e, a, b);
+
+    if (job.layout.y == 1) // square
+    {
+        const float2 x = out * job.style.x;
+
+        switch (e)
+        {
+            case 0:  a = p + v; b = p + v + x; return true;
+            case 1:  a = p + v + x; b = p - v + x; return true;
+            case 2:  a = p - v + x; b = p - v; return true;
+            default: return false;
+        }
+    }
+
+    a = p + v;
+    b = p - v;
+    return e == 0;
+}
+
+// Point k's part of a sub-path's outline, in stroke space: (for an open sub-path's first point,
+// the start cap,) the two offset edges of the segment starting at it and its join with the next;
+// an open sub-path's last point has the end cap. Built once per vertex, then read edge by edge
+// (pointEdge).
+struct PointOutline
+{
+    bool capsOnly;                          // an open sub-path's last point
+    float2 p0, t0, n0;
+    float2 leftStart, leftEnd, rightStart, rightEnd;
+    bool hasJoin;
+    Joint join;
+};
+
+PointOutline pointOutline (const device StrokePoint* points, StrokeSub sub, const device StrokeJob& job, uint k)
+{
+    const uint n = sub.count;
+    const bool closed = sub.closed != 0;
+    const uint segments = closed ? n : n - 1;
+    const float hw = job.style.x;
+
+    PointOutline o;
+    o.capsOnly = k >= segments;
+    o.p0 = points[sub.first + k].p;
+
+    if (o.capsOnly)
+        return o;
+
+    const float2 p1 = points[sub.first + (k + 1) % n].p;
+    o.t0 = normalize (p1 - o.p0);
+    o.n0 = hw * float2 (-o.t0.y, o.t0.x);
+
+    // The offset edges, ending where they meet the neighbours' on an inner side.
+    o.leftStart = o.p0 + o.n0;
+    o.rightStart = o.p0 - o.n0;
+    o.leftEnd = p1 + o.n0;
+    o.rightEnd = p1 - o.n0;
+
+    if (k > 0 || closed)
+    {
+        const Joint J = strokeJoint (points, sub, k, hw);
+
+        if (J.innerMeets)
+            (J.cr > 0.0 ? o.leftStart : o.rightStart) = J.inner;
+    }
+
+    o.hasJoin = k + 1 < segments || closed;
+
+    if (o.hasJoin)
+    {
+        o.join = strokeJoint (points, sub, k + 1, hw);
+
+        if (o.join.innerMeets)
+            (o.join.cr > 0.0 ? o.leftEnd : o.rightEnd) = o.join.inner;
+    }
+
+    return o;
+}
+
+bool pointEdge (thread const PointOutline& o, const device StrokePoint* points, StrokeSub sub, const device StrokeJob& job,
+                uint k, uint e, thread float2& a, thread float2& b)
+{
+    const float hw = job.style.x;
+    const uint capEdges = job.layout.z;
+
+    if (o.capsOnly)
+    {
+        const float2 t = normalize (o.p0 - points[sub.first + k - 1].p);
+        return capEdge (job, o.p0, t, hw * float2 (-t.y, t.x), e, a, b);
+    }
+
+    if (k == 0 && sub.closed == 0)
+    {
+        if (e < capEdges)
+            return capEdge (job, o.p0, -o.t0, -o.n0, e, a, b);
+
+        e -= capEdges;
+    }
+
+    switch (e)
+    {
+        case 0:  a = o.leftStart; b = o.leftEnd; return true;
+        case 1:  a = o.rightEnd; b = o.rightStart; return true;
+        default: return o.hasJoin && joinEdge (job, o.join, e - 2, a, b);
+    }
+}
+
+struct StrokeOut
+{
+    float4 pos [[position]];
+    float4 rect [[flat]];
+    uint count [[flat]]; // the edges in use, packed from e0
+    float4 e0 [[flat]], e1 [[flat]], e2 [[flat]], e3 [[flat]], e4 [[flat]], e5 [[flat]], e6 [[flat]], e7 [[flat]];
+};
+
+vertex StrokeOut strokeAccumVs (uint vid [[vertex_id]], uint iid [[instance_id]],
+                                const device StrokePoint* points [[buffer(0)]], constant float2& atlasSize [[buffer(1)]],
+                                constant uint& firstQuad [[buffer(2)]], const device StrokeSub* subs [[buffer(3)]],
+                                const device StrokeJob* jobs [[buffer(4)]], const device StrokeQuad* quads [[buffer(5)]])
+{
+    const StrokeQuad quad = quads[firstQuad + iid];
+    const StrokeSub sub = subs[quad.subAndEdge >> 8];
+    const device StrokeJob& job = jobs[sub.job];
+    const uint k = quad.point - sub.first, firstOfPoint = quad.subAndEdge & 255;
+
+    float4 edges[strokeEdgesPerQuad];
+    float2 lowest = float2 (FLT_MAX), highest = float2 (-FLT_MAX); // (fast math: no infinities)
+    uint count = 0;
+    const float2 s0 = points[sub.first + k].p, s1 = points[sub.first + (k + 1) % sub.count].p;
+    const float2 c0 = float2 (dot (job.xf0.xy, s0) + job.xf0.z, dot (job.xf1.xy, s0) + job.xf1.z);
+    const float2 c1 = float2 (dot (job.xf0.xy, s1) + job.xf0.z, dot (job.xf1.xy, s1) + job.xf1.z);
+    const float dxdy = c0.y != c1.y ? (c1.x - c0.x) / (c1.y - c0.y) : 0.0;
+    float margin = 0.0; // the furthest an edge gets from the segment's line, along x
+
+    const PointOutline outline = pointOutline (points, sub, job, k);
+
+    for (uint i = 0; i < strokeEdgesPerQuad; ++i)
+        edges[i] = float4 (0.0);
+
+    for (uint i = 0; i < strokeEdgesPerQuad; ++i)
+    {
+        float2 a, b;
+
+        if (pointEdge (outline, points, sub, job, k, firstOfPoint + i, a, b))
+        {
+            a = float2 (dot (job.xf0.xy, a) + job.xf0.z, dot (job.xf1.xy, a) + job.xf1.z);
+            b = float2 (dot (job.xf0.xy, b) + job.xf0.z, dot (job.xf1.xy, b) + job.xf1.z);
+
+            // Horizontal edges add no area.
+            if (a.y != b.y)
+            {
+                edges[count++] = float4 (a, b);
+                lowest = min (lowest, min (a, b));
+                highest = max (highest, max (a, b));
+                margin = max (margin, max (abs (a.x - c0.x - (a.y - c0.y) * dxdy), abs (b.x - c0.x - (b.y - c0.y) * dxdy)));
+            }
+        }
+    }
+
+    StrokeOut o;
+    o.rect = job.rect;
+    o.count = count;
+    o.e0 = edges[0]; o.e1 = edges[1]; o.e2 = edges[2]; o.e3 = edges[3];
+    o.e4 = edges[4]; o.e5 = edges[5]; o.e6 = edges[6]; o.e7 = edges[7];
+
+    if (count == 0)
+    {
+        o.pos = float4 (-2.0, -2.0, 0.0, 1.0);
+        return o;
+    }
+
+    // The cells the edges change, as accumVs: their rows, from the cell under their leftmost point
+    // to the one after their rightmost, within the rectangle. An edge reaching left of the
+    // rectangle (the area cuts the stroke there) adds what lies left of it in its first column,
+    // which the box then starts from.
+    const float4 r = job.rect;
+    const bool crossesLeft = lowest.x < r.x;
+    const float y0 = max (floor (lowest.y), r.y);
+    const float y1 = max (y0, min (ceil (highest.y), r.w));
+    const float x0 = clamp (floor (lowest.x), r.x, r.z - 1.0);
+    const float x1 = clamp (floor (highest.x) + 2.0, x0 + 1.0, r.z);
+    const float2 corner = float2 (vid & 1, vid >> 1);
+    float2 p = mix (float2 (x0, y0), float2 (x1, y1), corner);
+
+    // Or a band along the point's segment, when narrower: an edge's distance along x from the
+    // segment's line is linear along it, so at most 'margin' (from its ends), and the line moves by
+    // up to 0.5 |dx/dy| across a row (see accumVs). An open sub-path's last point (its end cap)
+    // keeps the box.
+    const uint segments = sub.closed != 0 ? sub.count : sub.count - 1;
+
+    if (! crossesLeft && k < segments && c0.y != c1.y)
+    {
+        const float halfWidth = 0.5 * abs (dxdy) + margin;
+
+        if (2.0 * halfWidth + 3.0 < x1 - x0)
+        {
+            const float x = c0.x + (p.y - c0.y) * dxdy;
+            p.x = corner.x == 0.0 ? x - halfWidth - 1.0 : x + halfWidth + 2.0;
+        }
+    }
+
+    o.pos = float4 (p / atlasSize * float2 (2.0, -2.0) + float2 (-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+
+fragment float4 strokeAccumFs (StrokeOut in [[stage_in]])
+{
+    const float2 cell = floor (in.pos.xy);
+
+    if (cell.x < in.rect.x || cell.x >= in.rect.z)
+        discard_fragment();
+
+    // Only the edges in use (the same count over the quad, so these branches don't diverge).
+    const float left = in.rect.x;
+    float d = edgeDelta (in.e0, cell, left);
+
+    if (in.count > 1) d += edgeDelta (in.e1, cell, left);
+    if (in.count > 2) d += edgeDelta (in.e2, cell, left);
+    if (in.count > 3) d += edgeDelta (in.e3, cell, left);
+    if (in.count > 4) d += edgeDelta (in.e4, cell, left);
+    if (in.count > 5) d += edgeDelta (in.e5, cell, left);
+    if (in.count > 6) d += edgeDelta (in.e6, cell, left);
+    if (in.count > 7) d += edgeDelta (in.e7, cell, left);
+
+    if (d == 0.0)
+        discard_fragment();
+
+    return float4 (d, 0.0, 0.0, 0.0);
 }
 
 // One SIMD group per row of a path's rectangle: running sum of the deltas along the row, a SIMD
@@ -1510,6 +1890,13 @@ public:
         desc.vertexFunction = accumVs;
         desc.fragmentFunction = accumFs;
         accumPipeline = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+        id<MTLFunction> strokeAccumVs = [library newFunctionWithName: @"strokeAccumVs"];
+        id<MTLFunction> strokeAccumFs = [library newFunctionWithName: @"strokeAccumFs"];
+        desc.vertexFunction = strokeAccumVs;
+        desc.fragmentFunction = strokeAccumFs;
+        strokeAccumPipeline = [device newRenderPipelineStateWithDescriptor: desc error: &error];
+        [strokeAccumVs release];
+        [strokeAccumFs release];
         [accumVs release];
         [accumFs release];
 
@@ -1562,6 +1949,7 @@ public:
         [maskImagePipeline release];
         [accumPipeline release];
         [prefixSumPipeline release];
+        [strokeAccumPipeline release];
         [noMask release];
         [opaquePipeline release];
         [depthWriteState release];
@@ -1582,7 +1970,8 @@ public:
             && depthWriteState != nil && depthTestState != nil
             && std::all_of (std::begin (blendPipelines), std::end (blendPipelines),
                             [] (const auto& family) { return std::all_of (std::begin (family), std::end (family), [] (auto p) { return p != nil; }); })
-            && maskCoveragePipeline != nil && maskImagePipeline != nil && accumPipeline != nil && prefixSumPipeline != nil && noMask != nil;
+            && maskCoveragePipeline != nil && maskImagePipeline != nil && accumPipeline != nil && prefixSumPipeline != nil
+            && strokeAccumPipeline != nil && noMask != nil;
     }
 
     id<MTLDevice> device = nil;
@@ -1593,6 +1982,7 @@ public:
     static constexpr int numFamilies = 4;
     id<MTLRenderPipelineState> blendPipelines[numFamilies][4] {}; // [instance family][juce::BlendMode]
     id<MTLRenderPipelineState> maskCoveragePipeline = nil, maskImagePipeline = nil, accumPipeline = nil;
+    id<MTLRenderPipelineState> strokeAccumPipeline = nil;
     id<MTLComputePipelineState> prefixSumPipeline = nil;
     id<MTLTexture> noMask = nil;
     id<MTLSamplerState> nearestSampler = nil, linearSampler = nil, nearestRepeatSampler = nil, linearRepeatSampler = nil;
@@ -1698,6 +2088,10 @@ struct FrameRecorder
         coverageSegments.clear();
         coverageEntries.clear();
         coveragePages.clear();
+        strokePoints.clear();
+        strokeSubs.clear();
+        strokeJobs.clear();
+        strokeQuads.clear();
         shelfX = shelfY = shelfHeight = 0;
     }
 
@@ -1712,7 +2106,15 @@ struct FrameRecorder
         uint32_t firstSegment = 0, segmentCount = 0, firstEntry = 0, entryCount = 0, rowCount = 0;
         id<MTLTexture> deltas = nil, coverage = nil; // allocated at encode time
         bool evenOdd = false;                        // holds an even-odd path (see the coverage format)
+        uint32_t firstStrokeQuad = 0, strokeQuadCount = 0; // its strokes' quads (see strokeAccumVs)
     };
+
+    // Stroke expansion's input (see strokeAccumVs in the shader).
+    static constexpr uint32_t strokeEdgesPerQuad = 8;                                                        // must match 'strokeEdgesPerQuad'
+    struct StrokeJobData { Float4 xf0, xf1, rect, style; uint32_t joint, cap, capEdges, maxArcSteps; }; // must match 'StrokeJob'
+    struct StrokeSub { uint32_t first, count, closed, job; };                                          // must match 'StrokeSub'
+    struct StrokeQuad { uint32_t point, subAndEdge; };                                                 // must match 'StrokeQuad'
+    struct StrokePoint { float x, y; };                                                                      // must match 'StrokePoint'
 
     static constexpr int coveragePageWidth = 2048, coveragePageMaxHeight = 4096;
 
@@ -1746,8 +2148,9 @@ struct FrameRecorder
         return job.page;
     }
 
-    /*  The same for the outline of a stroke (PathStrokeType::createStrokedPath (outline, path,
-        strokeTransform, accuracy)), drawn through 'toDevice'.
+    /*  The same for a stroke of 'path' (transformed by 'strokeTransform', flattened with
+        'accuracy', as PathStrokeType::createStrokedPath), drawn through 'toDevice'. Its outline
+        is built on the GPU (strokeAccumVs).
     */
     int addCoverageStroke (const Path& path, const PathStrokeType& stroke, const AffineTransform& strokeTransform,
                            float accuracy, const AffineTransform& toDevice, Rectangle<int> area, Point<int>& atlasOrigin)
@@ -1763,12 +2166,16 @@ struct FrameRecorder
     }
 
     /*  Encode thread, before the segments are uploaded: flattens each recorded path into its
-        page's segments (pages hold consecutive jobs).
+        page's segments, and each stroke's centre line into the stroke expansion's input (pages
+        hold consecutive jobs).
     */
     void resolveCoverage()
     {
         coverageSegments.clear();
-        Path outline;
+        strokePoints.clear();
+        strokeSubs.clear();
+        strokeJobs.clear();
+        strokeQuads.clear();
         auto lastPage = -1;
 
         for (const auto& job : coverageJobs)
@@ -1779,23 +2186,267 @@ struct FrameRecorder
             {
                 page.firstSegment = (uint32_t) coverageSegments.size();
                 page.segmentCount = 0;
+                page.firstStrokeQuad = (uint32_t) strokeQuads.size();
+                page.strokeQuadCount = 0;
                 lastPage = job.page;
             }
 
             const auto first = coverageSegments.size();
+            const auto firstQuad = strokeQuads.size();
 
             if (job.stroke.getStrokeThickness() > 0.0f)
+                addStroke (job);
+            else
+                addSegments (job.path, job);
+
+            page.segmentCount += (uint32_t) (coverageSegments.size() - first);
+            page.strokeQuadCount += (uint32_t) (strokeQuads.size() - firstQuad);
+        }
+    }
+
+    /*  A stroke's centre line, flattened as PathStrokeType::createStrokedPath does it (in the
+        stroke's space, with its tolerance, merging segments shorter than its minimum), and the
+        parameters with which strokeAccumVs builds its outline.
+    */
+    void addStroke (const CoverageJob& job)
+    {
+        const auto& stroke = job.stroke;
+        const auto& xf = job.toDevice;
+        const auto halfWidth = 0.5f * stroke.getStrokeThickness();
+
+        // Arcs (round joins and caps) in steps whose sagitta is at most 0.1 device pixel, at the
+        // transform's largest scale (its largest singular value), and at most 64 per half turn.
+        const auto sumSquares = xf.mat00 * xf.mat00 + xf.mat01 * xf.mat01 + xf.mat10 * xf.mat10 + xf.mat11 * xf.mat11;
+        const auto rowDifference = xf.mat00 * xf.mat00 + xf.mat01 * xf.mat01 - xf.mat10 * xf.mat10 - xf.mat11 * xf.mat11;
+        const auto rowDot = xf.mat00 * xf.mat10 + xf.mat01 * xf.mat11;
+        const auto maxScale = std::sqrt (0.5f * (sumSquares + std::sqrt (rowDifference * rowDifference + 4.0f * rowDot * rowDot)));
+        const auto radius = halfWidth * maxScale;
+        constexpr auto tolerance = 0.1f, pi = MathConstants<float>::pi;
+        const auto step = jmax (pi / 64.0f, radius > tolerance ? 2.0f * std::acos (1.0f - tolerance / radius) : pi);
+        const auto maxArcSteps = (uint32_t) jlimit (1.0f, 64.0f, std::ceil (pi / step));
+
+        // The edges each point owns (see strokeAccumVs): two offset edges and a join (miter: an
+        // edge to the miter point and two bevels; bevel: two; round: a bevel and the arc's steps,
+        // counted here when they could take more than a quad, with one to spare for rounding, else
+        // the most a half turn takes); an open sub-path's first and last points have a cap each
+        // (butt: one edge; square: three; round: an arc).
+        const auto joint = stroke.getJointStyle();
+        const auto cap = stroke.getEndStyle();
+        const auto capEdges = cap == PathStrokeType::square ? 3u : (cap == PathStrokeType::rounded ? maxArcSteps : 1u);
+        const auto countArcSteps = joint == PathStrokeType::curved && 2 + 1 + maxArcSteps > strokeEdgesPerQuad;
+        const auto miterLimit = jmax (1.0f, stroke.getMiterLimit());
+
+        const auto joinEdgesAt = [&] (size_t first, size_t n, size_t j) -> uint32_t
+        {
+            if (joint == PathStrokeType::mitered)
+                return 3;
+
+            if (joint == PathStrokeType::beveled)
+                return 2;
+
+            if (! countArcSteps)
+                return 1 + maxArcSteps;
+
+            const auto& b = strokePoints[first + (j + n - 1) % n];
+            const auto& p = strokePoints[first + j % n];
+            const auto& a = strokePoints[first + (j + 1) % n];
+            const auto t0 = Point<float> (p.x - b.x, p.y - b.y), t1 = Point<float> (a.x - p.x, a.y - p.y);
+            const auto turn = std::abs (std::atan2 (t0.x * t1.y - t0.y * t1.x, t0.x * t1.x + t0.y * t1.y));
+            return jmax (2u, 1 + jmin (maxArcSteps, (uint32_t) std::ceil (turn / step) + 1));
+        };
+
+        const auto dx = (float) (job.atlasOrigin.x - job.area.getX()), dy = (float) (job.atlasOrigin.y - job.area.getY());
+        const auto jobIndex = (uint32_t) strokeJobs.size();
+        strokeJobs.push_back ({ { xf.mat00, xf.mat01, xf.mat02 + dx, 0.0f },
+                                { xf.mat10, xf.mat11, xf.mat12 + dy, 0.0f },
+                                { (float) job.atlasOrigin.x, (float) job.atlasOrigin.y,
+                                  (float) (job.atlasOrigin.x + job.area.getWidth()), (float) (job.atlasOrigin.y + job.area.getHeight()) },
+                                { halfWidth, square (miterLimit), step, 0.0f },
+                                (uint32_t) joint, (uint32_t) cap, capEdges, maxArcSteps });
+
+        // Only the part of the centre line that can reach the area is kept: segments beyond
+        // where the outline reaches (half the width, times the miter limit or sqrt 2 for square
+        // caps, plus a pixel) are dropped and those crossing that margin are cut there, so that a
+        // long path mostly outside the area costs nothing, and no edge starts so far away that its
+        // coordinates lose precision. The ends this makes, and their caps, lie outside the area.
+        Rectangle<float> keep;
+        const auto rowDifferenceMin = sumSquares - std::sqrt (rowDifference * rowDifference + 4.0f * rowDot * rowDot);
+        const auto minScale = std::sqrt (jmax (0.0f, 0.5f * rowDifferenceMin));
+        const auto cull = minScale > 1.0e-6f;
+
+        if (cull)
+        {
+            const auto reach = halfWidth * jmax (joint == PathStrokeType::mitered ? miterLimit : 1.0f,
+                                                 cap == PathStrokeType::square ? MathConstants<float>::sqrt2 : 1.0f);
+            keep = job.area.toFloat().transformedBy (xf.inverted()).expanded (reach + 1.0f / minScale);
+        }
+
+        auto subFirst = strokePoints.size();
+        auto closed = false, cut = false;
+
+        const auto addPoint = [&] (Point<float> p)
+        {
+            if (strokePoints.size() > subFirst && exactlyEqual (strokePoints.back().x, p.x) && exactlyEqual (strokePoints.back().y, p.y))
+                return;
+
+            strokePoints.push_back ({ p.x, p.y });
+        };
+
+        const auto endSubPath = [&]
+        {
+            const auto isClosed = closed && ! cut;
+            auto count = strokePoints.size() - subFirst;
+
+            // A closed sub-path's last point is its first.
+            if (isClosed && count > 1)
             {
-                job.stroke.createStrokedPath (outline, job.path, job.strokeTransform, job.strokeAccuracy);
-                addSegments (outline, job);
+                strokePoints.pop_back();
+                --count;
+            }
+
+            if (count >= 2)
+            {
+                // Its points' quads, eight edges each.
+                const auto subIndex = (uint32_t) strokeSubs.size();
+                jassert (subIndex < (1u << 24));
+                strokeSubs.push_back ({ (uint32_t) subFirst, (uint32_t) count, isClosed ? 1u : 0u, jobIndex });
+                const auto segments = isClosed ? count : count - 1;
+
+                for (size_t k = 0; k < count; ++k)
+                {
+                    uint32_t edges = capEdges;
+
+                    if (k < segments)
+                    {
+                        edges = 2 + (k == 0 && ! isClosed ? capEdges : 0u);
+
+                        if (k + 1 < segments || isClosed)
+                            edges += joinEdgesAt (subFirst, count, k + 1);
+                    }
+
+                    for (uint32_t e = 0; e < edges; e += strokeEdgesPerQuad)
+                        strokeQuads.push_back ({ (uint32_t) (subFirst + k), subIndex << 8 | e });
+                }
             }
             else
             {
-                addSegments (job.path, job);
+                strokePoints.resize (subFirst);
             }
 
-            page.segmentCount += (uint32_t) (coverageSegments.size() - first);
+            subFirst = strokePoints.size();
+            closed = false;
+        };
+
+        const auto addSegment = [&] (Point<float> from, Point<float> to)
+        {
+            auto a = from, b = to;
+
+            if (cull && ! clipToRectangle (a, b, keep))
+            {
+                cut = true;
+                endSubPath();
+                return;
+            }
+
+            if (a != from)
+            {
+                cut = true;
+                endSubPath();
+            }
+
+            if (strokePoints.size() == subFirst)
+                addPoint (a);
+
+            addPoint (b);
+
+            if (b != to)
+            {
+                cut = true;
+                endSubPath();
+            }
+        };
+
+        // PathStrokeHelpers::createStroke's iteration: a segment is kept if it is long enough,
+        // closes its sub-path or ends it; a short one is merged into the next.
+        constexpr auto minSegmentLengthSquared = 0.0001f;
+        Point<float> start;
+
+        for (PathFlatteningIterator it (job.path, job.strokeTransform, Path::defaultToleranceForMeasurement / job.strokeAccuracy); it.next();)
+        {
+            if (it.subPathIndex == 0)
+            {
+                endSubPath();
+                cut = false;
+                start = { it.x1, it.y1 };
+            }
+
+            const auto segmentX = it.x2 - start.x, segmentY = it.y2 - start.y;
+
+            if (it.closesSubPath || segmentX * segmentX + segmentY * segmentY > minSegmentLengthSquared || it.isLastInSubpath())
+            {
+                addSegment (start, { it.x2, it.y2 });
+
+                if (it.closesSubPath)
+                {
+                    closed = true;
+                    endSubPath();
+                    cut = false;
+                }
+
+                start = { it.x2, it.y2 };
+            }
         }
+
+        endSubPath();
+    }
+
+    // Liang-Barsky: clips the segment a-b to r, false if none of it is inside.
+    static bool clipToRectangle (Point<float>& a, Point<float>& b, Rectangle<float> r) noexcept
+    {
+        if (r.contains (a) && r.contains (b))
+            return true;
+
+        const auto d = b - a;
+        auto t0 = 0.0f, t1 = 1.0f;
+
+        const auto clipAgainst = [&] (float p, float q)
+        {
+            if (exactlyEqual (p, 0.0f))
+                return q >= 0.0f;
+
+            const auto t = q / p;
+
+            if (p < 0.0f)
+            {
+                if (t > t1)
+                    return false;
+
+                t0 = jmax (t0, t);
+            }
+            else
+            {
+                if (t < t0)
+                    return false;
+
+                t1 = jmin (t1, t);
+            }
+
+            return true;
+        };
+
+        if (! (clipAgainst (-d.x, a.x - r.getX()) && clipAgainst (d.x, r.getRight() - a.x)
+               && clipAgainst (-d.y, a.y - r.getY()) && clipAgainst (d.y, r.getBottom() - a.y)))
+            return false;
+
+        const auto origin = a;
+
+        if (t1 < 1.0f)
+            b = origin + d * t1;
+
+        if (t0 > 0.0f)
+            a = origin + d * t0;
+
+        return true;
     }
 
     CoverageJob& addCoverageJob (Rectangle<int> area, bool evenOdd)
@@ -2190,6 +2841,10 @@ struct FrameRecorder
     std::vector<Mask> masks;
     std::vector<CoverageJob> coverageJobs;
     std::vector<CoverageSegment> coverageSegments; // filled by resolveCoverage
+    std::vector<StrokePoint> strokePoints;          // the same, for strokeAccumVs
+    std::vector<StrokeSub> strokeSubs;
+    std::vector<StrokeJobData> strokeJobs;
+    std::vector<StrokeQuad> strokeQuads;            // the quads of strokeAccumVs
     std::vector<CoverageEntry> coverageEntries;
     std::vector<CoveragePage> coveragePages;
     int shelfX = 0, shelfY = 0, shelfHeight = 0;
@@ -2739,9 +3394,9 @@ public:
         if (delegate != nullptr)
             return delegate->context->strokePath (path, stroke, t);
 
-        // Same outline as LowLevelGraphicsContext's default: built in user space (stroke thickness
-        // in user units), with curve accuracy matching the physical pixel scale; built on the
-        // encode thread (see FrameRecorder::CoverageJob).
+        // Same centre line as LowLevelGraphicsContext's default: flattened in user space (stroke
+        // thickness in user units), with curve accuracy matching the physical pixel scale, on the
+        // encode thread (see FrameRecorder::CoverageJob); its outline is built on the GPU.
         const auto accuracy = getPhysicalPixelScaleFactor();
 
         id<MTLTexture> pattern = nil;
@@ -3342,6 +3997,10 @@ public:
             [f.gradients release];
             [f.coverageSegments release];
             [f.coverageEntries release];
+            [f.strokePoints release];
+            [f.strokeSubs release];
+            [f.strokeJobs release];
+            [f.strokeQuads release];
             [f.opaqueIndices release];
             [f.gradientStops release];
         }
@@ -3589,6 +4248,7 @@ private:
     struct Frame
     {
         id<MTLBuffer> instances = nil, gradients = nil, coverageSegments = nil, coverageEntries = nil, opaqueIndices = nil, gradientStops = nil;
+        id<MTLBuffer> strokePoints = nil, strokeSubs = nil, strokeJobs = nil, strokeQuads = nil;
         std::vector<id<MTLTexture>> pooled;   // mask/layer textures, back to the pool when this frame completes
         MetalRendering::DeferredReleases releases;
         MetalRendering::FrameRecorder recorder; // painted on the message thread, then encoded
@@ -3745,19 +4405,33 @@ private:
         return drawable;
     }
 
+    // Makes a frame's shared buffer hold at least 'bytes' (it grows to twice that, so that a
+    // growing scene doesn't reallocate it every frame).
+    void reserveBuffer (id<MTLBuffer>& buffer, size_t bytes)
+    {
+        bytes = jmax ((size_t) 256, bytes);
+
+        if (buffer == nil || buffer.length < bytes)
+        {
+            [buffer release];
+            buffer = [shared->device newBufferWithLength: bytes * 2 options: MTLResourceStorageModeShared];
+        }
+    }
+
+    template <typename Items>
+    void upload (id<MTLBuffer>& buffer, const Items& items)
+    {
+        using Item = typename Items::value_type;
+        reserveBuffer (buffer, items.size() * sizeof (Item));
+        std::copy (items.begin(), items.end(), static_cast<Item*> (buffer.contents));
+    }
+
     void encodeAndPresent (Frame& frame, id<MTLTexture> destination, bool renderSync)
     {
         auto& recorder = frame.recorder;
         const auto& clears = recorder.clears;
         const auto& instances = recorder.instances;
-        const auto count = clears.size() + instances.size();
-        const auto bytes = jmax ((size_t) 256, count * sizeof (MetalRendering::Instance));
-
-        if (frame.instances == nil || frame.instances.length < bytes)
-        {
-            [frame.instances release];
-            frame.instances = [shared->device newBufferWithLength: bytes * 2 options: MTLResourceStorageModeShared];
-        }
+        reserveBuffer (frame.instances, (clears.size() + instances.size()) * sizeof (MetalRendering::Instance));
 
         // The clears, then each target's instances in their reordered sequence (see
         // FrameRecorder::reorder); 'positionOf' maps a recorded instance to its buffer position.
@@ -3779,53 +4453,24 @@ private:
                 statistics->drawCallsTotal += (int64) target.batches.size();
         }
 
-        const auto& gradients = recorder.gradients;
-        const auto gradientBytes = jmax ((size_t) 256, gradients.size() * sizeof (MetalRendering::GradientInfo));
-
-        if (frame.gradients == nil || frame.gradients.length < gradientBytes)
-        {
-            [frame.gradients release];
-            frame.gradients = [shared->device newBufferWithLength: gradientBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (gradients.begin(), gradients.end(), static_cast<MetalRendering::GradientInfo*> (frame.gradients.contents));
-
-        const auto& stops = recorder.gradientStops;
-        const auto stopBytes = jmax ((size_t) 256, stops.size() * sizeof (MetalRendering::Float4));
-
-        if (frame.gradientStops == nil || frame.gradientStops.length < stopBytes)
-        {
-            [frame.gradientStops release];
-            frame.gradientStops = [shared->device newBufferWithLength: stopBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (stops.begin(), stops.end(), static_cast<MetalRendering::Float4*> (frame.gradientStops.contents));
+        upload (frame.gradients, recorder.gradients);
+        upload (frame.gradientStops, recorder.gradientStops);
 
         id<MTLCommandBuffer> commandBuffer = [shared->queue commandBuffer];
 
         // Coverage atlas pages first: path fills read them.
         using FR = MetalRendering::FrameRecorder;
-        const auto& segments = recorder.coverageSegments;
-        const auto segmentBytes = jmax ((size_t) 256, segments.size() * sizeof (FR::CoverageSegment));
+        upload (frame.coverageSegments, recorder.coverageSegments);
+        upload (frame.coverageEntries, recorder.coverageEntries);
 
-        if (frame.coverageSegments == nil || frame.coverageSegments.length < segmentBytes)
+        // Stroke expansion's input.
+        if (! recorder.strokePoints.empty())
         {
-            [frame.coverageSegments release];
-            frame.coverageSegments = [shared->device newBufferWithLength: segmentBytes * 2 options: MTLResourceStorageModeShared];
+            upload (frame.strokePoints, recorder.strokePoints);
+            upload (frame.strokeSubs, recorder.strokeSubs);
+            upload (frame.strokeJobs, recorder.strokeJobs);
+            upload (frame.strokeQuads, recorder.strokeQuads);
         }
-
-        std::copy (segments.begin(), segments.end(), static_cast<FR::CoverageSegment*> (frame.coverageSegments.contents));
-
-        const auto& entries = recorder.coverageEntries;
-        const auto entryBytes = jmax ((size_t) 256, entries.size() * sizeof (FR::CoverageEntry));
-
-        if (frame.coverageEntries == nil || frame.coverageEntries.length < entryBytes)
-        {
-            [frame.coverageEntries release];
-            frame.coverageEntries = [shared->device newBufferWithLength: entryBytes * 2 options: MTLResourceStorageModeShared];
-        }
-
-        std::copy (entries.begin(), entries.end(), static_cast<FR::CoverageEntry*> (frame.coverageEntries.contents));
 
         // Statistics: the coverage and mask phases go in their own command buffers, timed apart.
         const auto endPhase = [&] (int phase)
@@ -3875,6 +4520,19 @@ private:
             if (page.segmentCount > 0)
                 [accumEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
                                instanceCount: page.segmentCount baseInstance: page.firstSegment];
+
+            // Strokes: their quads (up to eight edges each), built by the vertex shader (strokeAccumVs).
+            if (page.strokeQuadCount > 0)
+            {
+                [accumEncoder setRenderPipelineState: shared->strokeAccumPipeline];
+                [accumEncoder setVertexBuffer: frame.strokePoints offset: 0 atIndex: 0];
+                [accumEncoder setVertexBytes: &page.firstStrokeQuad length: sizeof (page.firstStrokeQuad) atIndex: 2];
+                [accumEncoder setVertexBuffer: frame.strokeSubs offset: 0 atIndex: 3];
+                [accumEncoder setVertexBuffer: frame.strokeJobs offset: 0 atIndex: 4];
+                [accumEncoder setVertexBuffer: frame.strokeQuads offset: 0 atIndex: 5];
+                [accumEncoder drawPrimitives: MTLPrimitiveTypeTriangleStrip vertexStart: 0 vertexCount: 4
+                               instanceCount: page.strokeQuadCount];
+            }
             [accumEncoder endEncoding];
         }
 
@@ -3986,13 +4644,7 @@ private:
             for (const auto& target : recorder.targets)
                 total += target.opaque.size();
 
-            const auto opaqueBytes = jmax ((size_t) 256, total * sizeof (uint32_t));
-
-            if (frame.opaqueIndices == nil || frame.opaqueIndices.length < opaqueBytes)
-            {
-                [frame.opaqueIndices release];
-                frame.opaqueIndices = [shared->device newBufferWithLength: opaqueBytes * 2 options: MTLResourceStorageModeShared];
-            }
+            reserveBuffer (frame.opaqueIndices, total * sizeof (uint32_t));
 
             auto* opaqueDst = static_cast<uint32_t*> (frame.opaqueIndices.contents);
             size_t offset = 0;
