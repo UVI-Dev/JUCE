@@ -148,6 +148,8 @@ bool isAxisAligned (float4 inv) { return inv.y == 0.0 && inv.z == 0.0; }
 // edge, n being the edge's unit normal in device pixels: the box-filtered coverage that JUCE's
 // EdgeTable and CoreGraphics compute. A ramp of the distance alone, saturate (0.5 + t), is only
 // that area for horizontal and vertical edges; at 45 degrees it's off by up to 0.04 (11/255).
+// Using that ramp saved only 7% of the GPU time of a full repaint (2.57 to 2.39 ms on an M1): the
+// per-pixel cost is in the distance and its Jacobian, not in this area.
 // Piecewise: linear while the edge crosses two opposite sides of the square, quadratic while it
 // cuts a corner (a, b: the normal's larger and smaller components).
 float halfPlaneCoverage (float t, float2 n)
@@ -2132,6 +2134,10 @@ struct FrameRecorder
     static constexpr int coveragePageWidth = 2048, coveragePageMaxHeight = 4096;
 
     /*  Tested and not kept, measured on an M1 (Metal System Trace) and on a busy plug-in page:
+        - Triangulating paths into anti-aliased meshes (an earlier version of this renderer): on
+          GraphicsDemo's stroked paths, rebuilt every frame so that no mesh cache helps, 87% of
+          the time went into triangulation (sorting vertices, resolving intersections), and some
+          SVG paths failed to triangulate (about 6 per frame in its SVG demo).
         - Sparse coverage, as tile-based renderers do: a path's area cut into 32 x 16 tiles, only
           the runs of tiles its edges touch summed and composited, the others drawn solid or not at
           all from a winding number counted on the CPU (from the edges crossing each tile row's
@@ -2612,6 +2618,9 @@ struct FrameRecorder
         Each batch's area is WebRender's BatchRects: the union of its draws' bounds, plus the
         bounds themselves once the union is a poor fit (larger than their sum); a long list of
         them reverts to the union alone, which only stops searches earlier.
+        Tested and not kept: sorting the whole frame's draws (by group of non-overlapping draws in
+        painter's order, then by pipeline) gave the same batches on a widget grid for 0.7 ms more
+        encoding per full repaint.
         Rebuilds the target's batches over the new sequence, which starts at 'first' (in batch
         units) and returns the target's instance indices in that sequence. Encode thread.
     */
