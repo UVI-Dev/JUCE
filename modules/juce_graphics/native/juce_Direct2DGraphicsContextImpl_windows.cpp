@@ -85,6 +85,8 @@ class PushedLayers
 {
 public:
     PushedLayers() { pushedLayers.reserve (32); }
+    // Tested and not kept: skipping this reserve in copies (one per saveState) made no measurable difference
+    // on a widget grid of about 1200 children.
     PushedLayers (const PushedLayers&) { pushedLayers.reserve (32); }
 
    #if JUCE_DEBUG
@@ -329,6 +331,40 @@ public:
         if (geometry != nullptr)
             pushLayer (D2D1::LayerParameters1 (D2D1::InfiniteRect(), geometry));
     }
+
+    // Clip layer for a list of rectangles. When they are axis-aligned they are whole device pixels, so the mask
+    // can be aliased, as for the single-rectangle PushAxisAlignedClip. Otherwise the layer is the same as for any
+    // geometry clip.
+    //
+    // Measured with PresentMon on the component diagnostics demo, on an Intel Arc iGPU: the aliased mask took the
+    // GPU time per frame from 2.25 to 1.60 ms on average over its first 18 examples (the frame's paint areas are
+    // usually several rectangles, so most frames go through this layer). On an RTX 4060 the GPU time didn't
+    // change measurably.
+    //
+    // Tested and not kept, on the same scenes and machine:
+    // - Content bounds set to the mask's bounds instead of InfiniteRect: no measurable difference (2.27 vs
+    //   2.25 ms, within the run-to-run spread of about 5%), with or without the aliased mask.
+    // - D2D1_LAYER_OPTIONS1_INITIALIZE_FROM_BACKGROUND (as Firefox does for opaque layers): when the layer is
+    //   popped the copied background is blended over itself, so on images and translucent windows a
+    //   semi-transparent pixel under the layer gets more opaque even where nothing is drawn (alpha 102 became
+    //   163, the same on Intel, NVIDIA and WARP). Limited to opaque windows it gave the same pixels, but its
+    //   gain with the aliased mask (7%, 1.59 to 1.49 ms) went away with a newer Intel driver (1.58 vs 1.56 ms,
+    //   within the noise), and there was none on the RTX or with the antialiased mask.
+    void pushRectangleListClipLayer (ComSmartPtr<ID2D1Geometry> geometry, bool axisAligned)
+    {
+        if (geometry == nullptr)
+            return;
+
+        if (! axisAligned)
+        {
+            pushGeometryClipLayer (geometry);
+            return;
+        }
+
+        pushLayer (D2D1::LayerParameters1 (D2D1::InfiniteRect(), geometry, D2D1_ANTIALIAS_MODE_ALIASED));
+    }
+
+    bool hasNoLayers() const { return layers.isEmpty(); }
 
     void pushTransformedRectangleGeometryClipLayer (ComSmartPtr<ID2D1RectangleGeometry> geometry, const AffineTransform& transform)
     {

@@ -57,6 +57,8 @@ public:
     SavedState* pushFirstSavedState (Rectangle<int> initialClipRegion);
 
     SavedState* pushSavedState();
+    SavedState* getSavedState (size_t index) const { return savedClientStates[index].get(); }
+    size_t getNumSavedStates() const               { return savedClientStates.size(); }
     SavedState* popSavedState();
 
     void popAllSavedStates();

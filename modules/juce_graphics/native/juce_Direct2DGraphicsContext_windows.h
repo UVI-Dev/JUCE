@@ -161,6 +161,18 @@ protected:
         RectangleList<float> getList() const { return list; }
         bool isClipApplied() const { return clipApplied; }
 
+        bool operator== (const PendingClipList& other) const
+        {
+            if (clipApplied != other.clipApplied || list.getNumRectangles() != other.list.getNumRectangles())
+                return false;
+
+            for (int i = 0; i < list.getNumRectangles(); ++i)
+                if (list.getRectangle (i) != other.list.getRectangle (i))
+                    return false;
+
+            return true;
+        }
+
         void reset (Rectangle<float> maxBounds)
         {
             list = maxBounds;
@@ -174,11 +186,16 @@ protected:
 
     PendingClipList pendingClipList;
 
+    // saveState() doesn't apply the pending clip: the new state inherits it, and the parent's pending clip
+    // is kept here (one entry per saved state below the current one) to be restored by restoreState().
+    std::vector<PendingClipList> savedPendingClips;
+
     struct Pimpl;
     virtual Pimpl* getPimpl() const noexcept = 0;
 
     void resetPendingClipList();
-    void applyPendingClipList();
+    // allowSharedLayer: the clip layer may be pushed onto an outer saved state (see the definition)
+    void applyPendingClipList (bool allowSharedLayer = true);
     virtual void clearTargetBuffer() = 0;
 
     struct ScopedTransform
