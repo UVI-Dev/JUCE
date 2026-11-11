@@ -4065,7 +4065,12 @@ public:
         // Every token taken from here on becomes a frame: slots are used in turn, so the slot
         // taken now is the one of the frame three frames ago, whose GPU work is complete.
         if (dispatch_semaphore_wait (inFlight, DISPATCH_TIME_NOW) != 0)
+        {
+            if (statistics != nullptr)
+                ++statistics->skippedRefreshes;
+
             return dirty;
+        }
 
         auto& frame = frames[(size_t) (frameIndex++ % numFramesInFlight)];
         frame.number = frameIndex;
@@ -4238,7 +4243,9 @@ public:
                  << String ((double) gpuMicros.exchange (0) / 1000.0 / gpuFrameCount, 3) << " ms/frame"
                  << " (of which coverage accumulation " << phaseMs (0) << ", prefix sums " << phaseMs (1)
                  << ", masks " << phaseMs (2) << "), present copy "
-                 << String ((double) presentMicros.exchange (0) / 1000.0 / gpuFrameCount, 3) << " ms/frame; per frame: " << String ((double) instances / frames, 0) << " instances (" << String ((double) opaqueInstances / frames, 0) << " opaque) in "
+                 << String ((double) presentMicros.exchange (0) / 1000.0 / gpuFrameCount, 3) << " ms/frame; waits for a drawable "
+                 << String ((double) drawableWaitMicros.exchange (0) / 1000.0, 1) << " ms, " << missedDrawables.exchange (0) << " none, "
+                 << skippedRefreshes.exchange (0) << " refreshes with all frames in flight; per frame: " << String ((double) instances / frames, 0) << " instances (" << String ((double) opaqueInstances / frames, 0) << " opaque) in "
                  << String ((double) drawCallsTotal / frames, 0) << " draw calls, "
                  << String ((double) layers / frames, 1) << " layers (" << String ((double) layerPixels / frames / 1.0e6, 2) << " Mpx), "
                  << String ((double) masks / frames, 1) << " mask textures (" << String ((double) maskPixels / frames / 1.0e6, 2) << " Mpx), "
@@ -4267,6 +4274,7 @@ public:
         std::atomic<double> frameGpuStart { 0.0 };
         std::atomic<int> gpuFrames { 0 };
         std::atomic<int64> presentMicros { 0 };
+        std::atomic<int64> drawableWaitMicros { 0 }, missedDrawables { 0 }, skippedRefreshes { 0 };
         double encodeMsTotal = 0.0; // on the encode queue, like addFrame
         int64 drawCallsTotal = 0;   // instance batches after reordering, encode queue
 
@@ -4909,10 +4917,17 @@ private:
             @autoreleasepool
             {
                 id<MTLCommandBuffer> present = [queue commandBuffer];
+                const auto waitStart = Time::getMillisecondCounterHiRes();
                 id<CAMetalDrawable> drawable = encodePresentCopy (present, source, layer);
+
+                if (stats != nullptr)
+                    stats->drawableWaitMicros += (int64) ((Time::getMillisecondCounterHiRes() - waitStart) * 1000.0);
 
                 if (drawable == nil)
                 {
+                    if (stats != nullptr)
+                        ++stats->missedDrawables;
+
                     requestRepaint();
                     return;
                 }
