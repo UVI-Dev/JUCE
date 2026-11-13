@@ -5052,6 +5052,10 @@ public:
 
     void onVBlank() override
     {
+        // See D2DRenderContext::onVBlank.
+        if (GetUpdateRect (peer.getHWND(), nullptr, FALSE))
+            handlePaintMessage();
+
         if (! std::exchange (schedulePaintOnVblank, false))
             return;
 
@@ -5333,6 +5337,15 @@ public:
 
     void onVBlank() override
     {
+        // WM_PAINT is only synthesised once no input is queued, so a steady stream of mouse
+        // moves would starve painting. Pull the update region here instead of waiting for it;
+        // validating it also cancels the pending WM_PAINT, so nothing is painted twice.
+        // During a 1 kHz mouse drag whose handler takes 2 ms or more, the window painted about
+        // once per second without this, and at the display rate (90 Hz) with it, for both
+        // renderers.
+        if (GetUpdateRect (peer.getHWND(), nullptr, FALSE))
+            handlePaintMessage();
+
         if (std::exchange (schedulePaintOnVblank, false))
             handleDirect2DPaint();
     }
